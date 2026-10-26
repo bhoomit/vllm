@@ -341,7 +341,15 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
 
                 if result.outputs[0].logprobs is not None:
                     logprobs = result.outputs[0].logprobs[0]
-                    if request_allowed is not None:
+                    # Drop candidates a mask has ruled out. `-inf` scores reach
+                    # here whenever something masked the logits -- an allowlist, a
+                    # grammar, a logits processor -- and such a token is not a beam
+                    # the search may take. This ran only when the request carried an
+                    # allowlist, so otherwise a `-inf` candidate could be admitted
+                    # and, with every sibling equally impossible, win on score.
+                    if request_allowed is not None or any(
+                        not math.isfinite(score.logprob) for score in logprobs.values()
+                    ):
                         logprobs = {
                             token: score
                             for token, score in sorted(
@@ -349,7 +357,8 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
                                 key=lambda item: item[1].logprob,
                                 reverse=True,
                             )
-                            if token in request_allowed and math.isfinite(score.logprob)
+                            if (request_allowed is None or token in request_allowed)
+                            and math.isfinite(score.logprob)
                         }
                         for score in logprobs.values():
                             score.rank = None
@@ -392,10 +401,23 @@ class BeamSearchOfflineMixin(OfflineInferenceMixin):
                 "with structured outputs"
             )
 
-        # Resolve the backend name from engine config if not already set.
-        if not structured_outputs._backend:
-            structured_outputs._backend = so_config.backend
-
+        # `_backend` holds the unresolved `auto` sentinel until
+        # `_validate_structured_outputs` resolves it, which the engine reaches through
+        # `SamplingParams.verify()` per request -- but the backend is built here,
+        # before any request exists. Run just that resolver on a probe carrying the
+        # same `structured_outputs` object, so resolution mutates it in place.
+        #
+        # Deliberately not the whole of `verify()`: that also runs the logprobs,
+        # logit-bias, trace-replay, stop-token, allowed-token, spec-decode and
+        # diffusion validators, none of which have anything to do with choosing a
+        # backend, and any of which could later start rejecting requests from here.
+        SamplingParams(
+            structured_outputs=structured_outputs
+        )._validate_structured_outputs(
+            vllm_config.model_config,
+            vllm_config.structured_outputs_config,
+            tokenizer,
+        )
         backend_name = structured_outputs._backend
         vocab_size = self.model_config.get_vocab_size()
 
